@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <link rel="stylesheet" href="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/styles/atom-one-light.min.css">
+    <script src="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/highlight.min.js"></script>
+    <script>hljs.initHighlightingOnLoad();</script>
+
+    <link rel="apple-touch-icon" sizes="180x180" href="/images/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/images/favicon-16x16.png">
+    <link rel="manifest" href="/images/site.webmanifest">
+
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="">
+    <title>DNS panic attacks in Kubernetes (EKS) | Episodes of an engineer in production</title>
+    <link rel="stylesheet" href="/css/style.css" />
+    <link rel="stylesheet" href="/css/fonts.css" />
+    
+    <header>
+
+  <nav>
+    <ul>
+      
+      
+      <li class="pull-left ">
+        <a href="http://example.org/">~/episodes of an engineer in production</a>
+      </li>
+      
+
+      
+
+    </ul>
+  </nav>
+</header>
+
+  </head>
+
+  <body>
+    <br/>
+
+<div class="article-meta">
+<h1><span class="title">DNS panic attacks in Kubernetes (EKS)</span></h1>
+
+<h2 class="date">2020/08/17</h2>
+<p class="terms">
+  
+  
+  
+  
+  
+</p>
+</div>
+
+
+<div class="content-wrapper">
+  <main>
+    <p>After moving an application from an EC2 fleet to a Kubernetes cluster hosted on AWS EKS, we started to face some errors due to DNS resolution. The errors where more during intensive usage of the app (bellow an example of the errors we were facing).</p>
+<pre><code>PDOException: Noticed exception 'PDOException' with message 'SQLSTATE[HY000] [2002] php_network_getaddresses: getaddrinfo failed: Temporary failure in name resolution'
+</code></pre><p>We started by checking the overall health of the cluster. Started by evaluating  the CoreDNS pods resources and moving forward to the resource usage from each node (bandwidth, cpu, memory). With all those measurements one thing was clear, the problem apparently is not directly related with physical resource usage.
+Once we knew that we were free of resource starvation, got inside one of the application pods and performed some DNS queries continuesly, it was confirmed the DNS service was in a intermittent working
+state.</p>
+<p>In contact with AWS Support we got the confirmation:</p>
+<blockquote>
+<p>You are being throttled!</p>
+</blockquote>
+<h3 id="observability-on-coredns">Observability on CoreDNS</h3>
+<p>One of the worst things that can happen when debugging something is the lack of observability in a service. It’s highly recommended that you collect met‐
+rics and analise to better understand what they mean. To expose CoreDNS metrics, you need to enable the Prometheus <a href="https://coredns.io/plugins/metrics/">plugin</a> CoreDNS. To export them and then make your monitoring system to gather them.</p>
+<p>CoreDNS also has a plugin for <a href="https://coredns.io/plugins/log/">logging</a>, enable logging on CoreDNS will be quite useful since it will helps us to understand which DNS query got each response, but for this I highly recommend you to use some log aggregator to ingest all this logs.</p>
+<p>Having this in place, we will be able to observe fundamental metrics from our CoreDNS service, such as:</p>
+<ul>
+<li>Total query count</li>
+<li>DNS request duration</li>
+<li>DNS response code</li>
+</ul>
+<pre><code>.:53 {
+    errors
+    health
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      pods insecure
+      upstream
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf
+    cache 30
+    loop
+    reload
+    loadbalance
+    log . {combined} {
+            class denial error
+    }
+}
+</code></pre><p><em>If you have the reload plugin enabled, the CoreDNS will automatically reload the config, otherwise you will need to restart each pod.</em></p>
+<h3 id="a-party-of-unreachable-backends">A party of unreachable backends</h3>
+<p>Once the logging and the metrics were enabled, we opened the log of one of the pods. The behaviour for some queries matched the behaviour reported by the support:</p>
+<pre><code>...
+myamazingapp.eu-west-1.elb.amazonaws.com.eu-west-1.compute.internal. AAAA: unreachable backend: read udp 10.162.50.75:53995-&gt;10.162.50.2:53: i/o timeout
+...
+</code></pre><p><em>Technically, you can get throttled if you do a lot of requests. What if most of the requests are being executed from a few parts of the cluster nodes?</em></p>
+<pre><code>kubectl get pods -n kube-system -o wide | grep corends | awk '{print $7}' | sort | uniq -c
+</code></pre><p>One thing was confirmed, around 50% of the CoreDNS pods were placed into a single node.</p>
+<p>Since we need to prevent the allocation of multiple CoreDNS pods in the same cluster node, we configured an <code>AntiAffinity</code> rule on CoreDNS deployment config the. The <em>HPA (Horizontal Pod Autoscaling)</em> was still needed for the times with more traffic, so since we were using a <code>ReplicaSet</code>, we kept it.</p>
+<pre><code>...
+        eks.amazonaws.com/component: coredns
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: eks.amazonaws.com/component
+                operator: In
+                values:
+                - coredns
+            topologyKey: kubernetes.io/hostname
+...
+</code></pre><h3 id="nxdomains-were-also-at-the-party">NXDOMAIN&rsquo;s were also at the party</h3>
+<p>Once the metrics were available, we discovered a huge number of NXDOMAIN&rsquo;s were visible. In a situation that you highly depend on the upstream DNS servers this can become an issue, due to the throttling.</p>
+<pre><code>[INFO] 10.*.*.17:43607 - 37066 &quot;A IN ssm.eu-west-1.amazonaws.com.kubernetes-external-secrets.svc.cluster.local. udp 91 false 512&quot; NXDOMAIN qr,aa,rd 184 0.000053579s &quot;0&quot;
+[INFO] 10.*.*.17:57091 - 12032 &quot;A IN ssm.eu-west-1.amazonaws.com.cluster.local. udp 59 false 512&quot; NXDOMAIN qr,aa,rd 152 0.000111246s &quot;0&quot;
+[INFO] 10.*.*.17:57833 - 16358 &quot;A IN ssm.eu-west-1.amazonaws.com.svc.cluster.local. udp 63 false 512&quot; NXDOMAIN qr,aa,rd 156 0.000057119s &quot;0&quot;
+[INFO] 10.*.*.17:60412 - 53922 &quot;A IN ssm.eu-west-1.amazonaws.com.eu-west-1.compute.internal. udp 72 false 512&quot; NXDOMAIN qr,rd,ra 72 0.000905037s &quot;0&quot;
+[INFO] 10.*.*.17:43959 - 61205 &quot;A IN ssm.eu-west-1.amazonaws.com.eu-west-1.compute.internal. udp 72 false 512&quot; NXDOMAIN qr,rd,ra 72 0.000801096s &quot;0&quot;
+</code></pre><h4 id="lets-first-understand-some-dns-responses">Let&rsquo;s first understand some DNS responses</h4>
+<p>In yellow, you can find what I think the most important responses to this use case.
+<img src="/dns_panic_attacks_in_kubernetes/dns_responses.png" alt="dns_response_types">
+Full RFC <a href="https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-6">here</a></p>
+<ul>
+<li><em>NoError</em> - It means that the query was properly resolved and returned.</li>
+<li><em>ServFail</em> - The server failed to resolve the requested record.</li>
+<li><em>NXDomain</em> - The domain doesn’t exist</li>
+</ul>
+<p><em><strong>NXDOMAIN&rsquo;s deserves a bit more of explanation so we can understand the impact of it.</strong></em></p>
+<h5 id="step-1---application-queries-for-a-non-existing-dns-record">Step 1 - Application queries for a non existing DNS record</h5>
+<p><img src="/dns_panic_attacks_in_kubernetes/nxdomain_step1.png" alt=""></p>
+<h5 id="step-2---coredns-cant-resolve-the-record-or-get-it-from-cache">Step 2 - CoreDNS can&rsquo;t resolve the record or get it from cache</h5>
+<p><img src="/dns_panic_attacks_in_kubernetes/nxdomain_step2.png" alt=""></p>
+<h5 id="step-3---aws-dns-also-cant-reolve-the-dns-query-so-a-nxdomain-response-is-returned">Step 3 - AWS DNS also can&rsquo;t reolve the DNS query, so a NXDOMAIN response is returned</h5>
+<p><img src="/dns_panic_attacks_in_kubernetes/nxdomain_step3.png" alt=""></p>
+<p>The problem here starts with the number of <code>NXDOMAIN</code> responses that are generated, with the value for <code>NDOTS</code> configured by Kubernetes deployment configuration to 5 which overwrites the <a href="https://linux.die.net/man/5/resolv.conf">default</a> value from <code>resolve.conf</code> which is 1.</p>
+<p><code>ndots</code> is a configuration located in resolv.conf, which usually is configured by the DeploymentConfig for a given pod. For instance, if you look into an application resolv.conf you will find something like this:</p>
+<pre><code>nameserver 10.160.20.1
+search myamazingappnamespace.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+</code></pre><p>Imagine that you run a DNS query to metadata.google.com, this means a query with two dots, since 2 is less than 5 dots, the DNS resolver will also attempt to run the DNS query metadata.google.com with all the domains in the list</p>
+<ul>
+<li>myamazingapp.svc.cluster.local</li>
+<li>svc.cluster.local</li>
+<li>cluster.local</li>
+</ul>
+<p>Most of this queries will result in an NXDomain response from the DNS server. In the end, the application ends up queriing AWS DNS servers for nonexisting records.
+The queries resulting in <code>NXDOMAIN</code> can be <code>query * n</code>, where <code>n</code> is the number of domains in <code>resolv.conf</code>.
+With this, the ammount of <code>NXDOMAIN</code> responses can turn up to be huge since the query will follow the domain list configured in <code>resolv.conf</code>.</p>
+<h4 id="lets-find-whos-triggering-nxdomain-queries">Let&rsquo;s find who&rsquo;s triggering <code>NXDOMAIN</code> queries</h4>
+<p>Once you have the logs being exported to a log aggregator, it is quite easy to identify what is the namespace of the application that is generating the requests resulting in <code>NXDOMAIN</code> replies.</p>
+<ol>
+<li>Since <code>.svc.cluster.local</code> is one of the domains placed in the <code>resolve.conf</code> of almost every application by the deployment config, lets query in the logs generated by CoreDNS for records containing this domain and the <code>NXDOMAIN</code> word. This way we can have an estimation about how many <code>NXDOMAIN</code> replies are being generated due to the number of <code>ndots</code>.
+In the example above you can see a query for AWS Cloudwatch Logs:</li>
+</ol>
+<pre><code>fields @timestamp, @message
+| filter log ~= /NXDOMAIN/ and log ~= /.svc.cluster.local./
+| sort @timestamp desc
+| limit 20
+</code></pre><p>Applications that have configured a high number of ndots, also query for a domain containing its namespace name on it, for example <code>ssm.eu-west-1.amazonaws.com.eu-west-1.compute.internal.</code>, so it reduces a lot the result that we need to look into.</p>
+<p><img src="/dns_panic_attacks_in_kubernetes/logrecords.png" alt="Log with namespace"></p>
+<ol start="2">
+<li>Let&rsquo;s refine a bit more our query, to look specifically for <code>NXDOMAIN</code> records on this specific domain <code>ssm.eu-west-1.amazonaws.com.eu-west-1.compute.internal.</code>.</li>
+</ol>
+<pre><code>fields @timestamp, @message
+| filter log ~= /NXDOMAIN/ and log ~= /ssm.eu-west-1.amazonaws.com.eu-west-1.compute.internal../
+| sort @timestamp desc
+| limit 20
+</code></pre><ol start="3">
+<li>Check the applications in the namespace and evaluate with the owner if you can patch the deployment config with a <code>ndots: 1</code></li>
+</ol>
+<pre><code>...
+spec:
+    dnsConfig:
+    options:
+    - name: ndots
+        value: &quot;1&quot;
+...
+</code></pre><p>Once the <code>ndots</code> is set to <code>1</code>, the number of <code>NXDOMAIN</code> response decreased drastically.
+<img src="/dns_panic_attacks_in_kubernetes/fix_applied.png" alt="fix applied"></p>
+<h3 id="conclusion">Conclusion</h3>
+<p>In an environment with such a high number of QPS not only special attention to the NXDOMAIN&rsquo;s is needed, but also to the configuration of <code>ndots</code> shown to help a lot.</p>
+<p>Even if we can reach a cache hit ratio on the DNS queries of 99.99%, HPA might also be needed on CoreDNS. Since replies from the cache are not for free, and in this use case associate the deployment config with an <code>AntiAffinity</code> rule also helped distributing the CoreDNS pods between all nodes and avoiding throttling from the upstream DNS (since the quota is per EC2 instance).</p>
+<p>A big part of this behavior can be highly improved by using <a href="https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/">NodeLocal DNSCache</a>. But unfortunately this feature is only available on Kubernetes 1.18 as stable and the cluster we operated was in 1.14.
+This feature also can improve the latency on queries resolution while resolving from cache since the requests don&rsquo;t leave the cluster node.</p>
+<p><img src="/dns_panic_attacks_in_kubernetes/nodelocaldns.svg" alt="NodeLocal DNSCache - https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/"></p>
+<h3 id="references">References</h3>
+<ul>
+<li><a href="https://tools.ietf.org/html/rfc6895">RFC-6895</a></li>
+<li><a href="https://accedian.com/blog/dns-query-main-types/#:~:text=DNS%20is%20a%20query%2Fresponse,to%20connect%20to%20the%20server.">DNS Query Types and Application Troubleshooting - Thierry Notermans</a></li>
+<li><a href="https://jvns.ca/blog/how-updating-dns-works/">What happens when you update your DNS? - Julia Evans</a></li>
+<li><a href="https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-dns-config">Pod DNS Config</a></li>
+<li><a href="https://man7.org/linux/man-pages/man5/resolv.conf.5.html">resolv.conf</a></li>
+<li><a href="http://www.networksorcery.com/enp/protocol/dns.htm">DNS, Network Sorcery</a></li>
+</ul>
+
+    <a href="/"> >> Home</a>
+  </main>
+</div>
+    <footer>
+      
+<script>
+(function() {
+  function center_el(tagName) {
+    var tags = document.getElementsByTagName(tagName), i, tag;
+    for (i = 0; i < tags.length; i++) {
+      tag = tags[i];
+      var parent = tag.parentElement;
+      
+      if (parent.childNodes.length === 1) {
+        
+        if (parent.nodeName === 'A') {
+          parent = parent.parentElement;
+          if (parent.childNodes.length != 1) continue;
+        }
+        if (parent.nodeName === 'P') parent.style.textAlign = 'center';
+      }
+    }
+  }
+  var tagNames = ['img', 'embed', 'object'];
+  for (var i = 0; i < tagNames.length; i++) {
+    center_el(tagNames[i]);
+  }
+})();
+</script>
+
+      
+    </footer>
+  </body>
+</html>
+
