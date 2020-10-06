@@ -57,17 +57,16 @@
   <main>
     <p>After moving an application from an EC2 fleet to a Kubernetes cluster hosted on AWS EKS, we started to face some errors due to DNS resolution. The errors where more during intensive usage of the app (bellow an example of the errors we were facing).</p>
 <pre><code>PDOException: Noticed exception 'PDOException' with message 'SQLSTATE[HY000] [2002] php_network_getaddresses: getaddrinfo failed: Temporary failure in name resolution'
-</code></pre><p>We started by checking the overall health of the cluster. Started by evaluating  the CoreDNS pods resources and moving forward to the resource usage from each node (bandwidth, cpu, memory). With all those measurements one thing was clear, the problem apparently is not directly related with physical resource usage.
-Once we knew that we were free of resource starvation, got inside one of the application pods and performed some DNS queries continuesly, it was confirmed the DNS service was in a intermittent working
+</code></pre><p>We started by checking the overall health of the cluster. Started by evaluating the CoreDNS pods resources and moving forward to the resource usage from each node (bandwidth, CPU, memory). With all those measurements one thing was clear, the problem apparently is not directly related to physical resource usage.
+Once we knew that we were free of resource starvation, got inside one of the application pods and performed some DNS queries continuously, it was confirmed the DNS service was in an intermittent working
 state.</p>
 <p>In contact with AWS Support we got the confirmation:</p>
 <blockquote>
 <p>You are being throttled!</p>
 </blockquote>
 <h3 id="observability-on-coredns">Observability on CoreDNS</h3>
-<p>One of the worst things that can happen when debugging something is the lack of observability in a service. It’s highly recommended that you collect met‐
-rics and analise to better understand what they mean. To expose CoreDNS metrics, you need to enable the Prometheus <a href="https://coredns.io/plugins/metrics/">plugin</a> CoreDNS. To export them and then make your monitoring system to gather them.</p>
-<p>CoreDNS also has a plugin for <a href="https://coredns.io/plugins/log/">logging</a>, enable logging on CoreDNS will be quite useful since it will helps us to understand which DNS query got each response, but for this I highly recommend you to use some log aggregator to ingest all this logs.</p>
+<p>One of the worst things that can happen when debugging something is the lack of observability in a service. It’s highly recommended that you collect metrics and analyse to better understand what they mean. To expose CoreDNS metrics, you need to enable the Prometheus <a href="https://coredns.io/plugins/metrics/">plugin</a> CoreDNS. To export them and then make your monitoring system to gather them.</p>
+<p>CoreDNS also has a plugin for <a href="https://coredns.io/plugins/log/">logging</a>, enable logging on CoreDNS will be quite useful since it will help us to understand which DNS query got each response, but for this, I highly recommend you to use some log aggregator to ingest all these logs.</p>
 <p>Having this in place, we will be able to observe fundamental metrics from our CoreDNS service, such as:</p>
 <ul>
 <li>Total query count</li>
@@ -92,7 +91,7 @@ rics and analise to better understand what they mean. To expose CoreDNS metrics,
             class denial error
     }
 }
-</code></pre><p><em>If you have the reload plugin enabled, the CoreDNS will automatically reload the config, otherwise you will need to restart each pod.</em></p>
+</code></pre><p><em>If you have the reload plugin enabled, the CoreDNS will automatically reload the config, otherwise, you will need to restart each pod.</em></p>
 <h3 id="a-party-of-unreachable-backends">A party of unreachable backends</h3>
 <p>Once the logging and the metrics were enabled, we opened the log of one of the pods. The behaviour for some queries matched the behaviour reported by the support:</p>
 <pre><code>...
@@ -137,7 +136,7 @@ Full RFC <a href="https://www.iana.org/assignments/dns-parameters/dns-parameters
 <p><img src="/dns_panic_attacks_in_kubernetes/nxdomain_step1.png" alt=""></p>
 <h5 id="step-2---coredns-cant-resolve-the-record-or-get-it-from-cache">Step 2 - CoreDNS can&rsquo;t resolve the record or get it from cache</h5>
 <p><img src="/dns_panic_attacks_in_kubernetes/nxdomain_step2.png" alt=""></p>
-<h5 id="step-3---aws-dns-also-cant-reolve-the-dns-query-so-a-nxdomain-response-is-returned">Step 3 - AWS DNS also can&rsquo;t reolve the DNS query, so a NXDOMAIN response is returned</h5>
+<h5 id="step-3---aws-dns-also-cant-resolve-the-dns-query-so-an-nxdomain-response-is-returned">Step 3 - AWS DNS also can&rsquo;t resolve the DNS query, so an NXDOMAIN response is returned</h5>
 <p><img src="/dns_panic_attacks_in_kubernetes/nxdomain_step3.png" alt=""></p>
 <p>The problem here starts with the number of <code>NXDOMAIN</code> responses that are generated, with the value for <code>NDOTS</code> configured by Kubernetes deployment configuration to 5 which overwrites the <a href="https://linux.die.net/man/5/resolv.conf">default</a> value from <code>resolve.conf</code> which is 1.</p>
 <p><code>ndots</code> is a configuration located in resolv.conf, which usually is configured by the DeploymentConfig for a given pod. For instance, if you look into an application resolv.conf you will find something like this:</p>
@@ -150,9 +149,9 @@ options ndots:5
 <li>svc.cluster.local</li>
 <li>cluster.local</li>
 </ul>
-<p>Most of this queries will result in an NXDomain response from the DNS server. In the end, the application ends up queriing AWS DNS servers for nonexisting records.
+<p>Most of these queries will result in an NXDomain response from the DNS server. In the end, the application ends up querying AWS DNS servers for nonexisting records.
 The queries resulting in <code>NXDOMAIN</code> can be <code>query * n</code>, where <code>n</code> is the number of domains in <code>resolv.conf</code>.
-With this, the ammount of <code>NXDOMAIN</code> responses can turn up to be huge since the query will follow the domain list configured in <code>resolv.conf</code>.</p>
+With this, the amount of <code>NXDOMAIN</code> responses can turn up to be huge since the query will follow the domain list configured in <code>resolv.conf</code>.</p>
 <h4 id="lets-find-whos-triggering-nxdomain-queries">Let&rsquo;s find who&rsquo;s triggering <code>NXDOMAIN</code> queries</h4>
 <p>Once you have the logs being exported to a log aggregator, it is quite easy to identify what is the namespace of the application that is generating the requests resulting in <code>NXDOMAIN</code> replies.</p>
 <ol>
@@ -187,7 +186,7 @@ spec:
 <h3 id="conclusion">Conclusion</h3>
 <p>In an environment with such a high number of QPS not only special attention to the NXDOMAIN&rsquo;s is needed, but also to the configuration of <code>ndots</code> shown to help a lot.</p>
 <p>Even if we can reach a cache hit ratio on the DNS queries of 99.99%, HPA might also be needed on CoreDNS. Since replies from the cache are not for free, and in this use case associate the deployment config with an <code>AntiAffinity</code> rule also helped distributing the CoreDNS pods between all nodes and avoiding throttling from the upstream DNS (since the quota is per EC2 instance).</p>
-<p>A big part of this behavior can be highly improved by using <a href="https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/">NodeLocal DNSCache</a>. But unfortunately this feature is only available on Kubernetes 1.18 as stable and the cluster we operated was in 1.14.
+<p>A big part of this behaviour can be highly improved by using <a href="https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/">NodeLocal DNSCache</a>. But unfortunately, this feature is only available on Kubernetes 1.18 as stable and the cluster we operated was in 1.14.
 This feature also can improve the latency on queries resolution while resolving from cache since the requests don&rsquo;t leave the cluster node.</p>
 <p><img src="/dns_panic_attacks_in_kubernetes/nodelocaldns.svg" alt="NodeLocal DNSCache - https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/"></p>
 <h3 id="references">References</h3>
